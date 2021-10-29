@@ -405,6 +405,15 @@ func initialize() ([]store.KubeconfigStore, *types.Config, error) {
 		var s store.KubeconfigStore
 
 		switch kubeconfigStoreFromConfig.Kind {
+		case types.StoreKindEKS:
+			eksStore, err := store.NewEKSStore(kubeconfigStoreFromConfig)
+			if err != nil {
+				if kubeconfigStoreFromConfig.Required != nil && !*kubeconfigStoreFromConfig.Required {
+					continue
+				}
+				return nil, nil, err
+			}
+			s = eksStore
 		case types.StoreKindFilesystem:
 			filesystemStore, err := store.NewFilesystemStore(kubeconfigName, kubeconfigStoreFromConfig)
 			if err != nil {

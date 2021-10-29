@@ -16,6 +16,7 @@ package store
 
 import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice"
+	awseks "github.com/aws/aws-sdk-go-v2/service/eks"
 	"github.com/danielfoehrkn/kubeswitch/types"
 	vaultapi "github.com/hashicorp/vault/api"
 	"github.com/sirupsen/logrus"
@@ -99,6 +100,13 @@ type GardenerStore struct {
 	// all the discovered secrets.
 	// This way we can save some requests against the API when getting the kubeconfig later
 	SecretNamespaceNameToSecret map[string]corev1.Secret
+}
+
+type EKSStore struct {
+	Logger          *logrus.Entry
+	KubeconfigStore types.KubeconfigStore
+	Client          *awseks.Client
+	Config          *types.StoreConfigEKS
 }
 
 // TODO: implement previewer interface
