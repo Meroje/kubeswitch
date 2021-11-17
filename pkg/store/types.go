@@ -17,6 +17,7 @@ package store
 import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice"
 	awseks "github.com/aws/aws-sdk-go-v2/service/eks"
+	eks "github.com/aws/aws-sdk-go-v2/service/eks/types"
 	"github.com/danielfoehrkn/kubeswitch/types"
 	vaultapi "github.com/hashicorp/vault/api"
 	"github.com/sirupsen/logrus"
@@ -107,6 +108,11 @@ type EKSStore struct {
 	KubeconfigStore types.KubeconfigStore
 	Client          *awseks.Client
 	Config          *types.StoreConfigEKS
+	// DiscoveredClusters maps the kubeconfig path (az_<resource-group>--<cluster-name>) -> cluster
+	// This is a cache for the clusters discovered during the initial search for kubeconfig paths
+	// when not using a search index
+	DiscoveredClusters map[string]*eks.Cluster
+	StateDirectory     string
 }
 
 // TODO: implement previewer interface

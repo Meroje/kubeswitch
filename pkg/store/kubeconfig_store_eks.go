@@ -17,16 +17,20 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awseks "github.com/aws/aws-sdk-go-v2/service/eks"
+	awsekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
+	"github.com/aws/smithy-go/logging"
 	"github.com/danielfoehrkn/kubeswitch/types"
+	"github.com/disiqueira/gotree"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
 
-func NewEKSStore(store types.KubeconfigStore) (*EKSStore, error) {
+func NewEKSStore(store types.KubeconfigStore, stateDir string) (*EKSStore, error) {
 	eksStoreConfig := &types.StoreConfigEKS{}
 	if store.Config != nil {
 		buf, err := yaml.Marshal(store.Config)
@@ -41,9 +45,10 @@ func NewEKSStore(store types.KubeconfigStore) (*EKSStore, error) {
 	}
 
 	return &EKSStore{
-		Logger:          logrus.New().WithField("store", types.StoreKindEKS),
-		KubeconfigStore: store,
-		Config:          eksStoreConfig,
+		KubeconfigStore:    store,
+		Config:             eksStoreConfig,
+		StateDirectory:     stateDir,
+		DiscoveredClusters: make(map[string]*awsekstypes.Cluster),
 	}, nil
 }
 
@@ -51,7 +56,10 @@ func (s *EKSStore) InitializeEKSStore() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	optFns := []func(*awsconfig.LoadOptions) error{}
+	optFns := []func(*awsconfig.LoadOptions) error{
+		awsconfig.WithLogger(AWSLogrusBridgeLogger{Logger: s.GetLogger()}),
+		// awsconfig.WithClientLogMode(aws.LogResponseWithBody | aws.LogRetries),
+	}
 
 	if s.Config != nil {
 		if s.Config.Region != nil {
@@ -78,9 +86,11 @@ func (s *EKSStore) IsInitialized() bool {
 
 func (s *EKSStore) GetID() string {
 	id := "default"
+
 	if s.KubeconfigStore.ID != nil {
 		id = *s.KubeconfigStore.ID
 	}
+
 	return fmt.Sprintf("%s.%s", types.StoreKindEKS, id)
 }
 
@@ -88,15 +98,27 @@ func (s *EKSStore) GetKind() types.StoreKind {
 	return types.StoreKindEKS
 }
 
+func (s *EKSStore) GetStoreConfig() types.KubeconfigStore {
+	return s.KubeconfigStore
+}
+
+func (s *EKSStore) GetLogger() *logrus.Entry {
+	if s.Logger == nil {
+		s.Logger = logrus.WithField("store", s.GetID())
+	}
+	return s.Logger
+}
+
 func (s *EKSStore) GetContextPrefix(path string) string {
 	if s.GetStoreConfig().ShowPrefix != nil && !*s.GetStoreConfig().ShowPrefix {
 		return ""
 	}
 
-	return fmt.Sprintf("%s/%s/%s", s.GetID(), *s.Config.Profile, *s.Config.Region)
+	return strings.ReplaceAll(path, "--", "-")
 }
 
 func (s *EKSStore) VerifyKubeconfigPaths() error {
+	// NOOP
 	return nil
 }
 
@@ -113,8 +135,10 @@ func (s *EKSStore) StartSearch(channel chan SearchResult) {
 	}
 
 	opts := &awseks.ListClustersInput{}
-	for {
-		clusters, err := s.Client.ListClusters(ctx, opts)
+	pager := awseks.NewListClustersPaginator(s.Client, opts)
+	for pager.HasMorePages() {
+		s.GetLogger().Debugf("next page found")
+		resp, err := pager.NextPage(ctx)
 		if err != nil {
 			channel <- SearchResult{
 				Error: err,
@@ -122,18 +146,31 @@ func (s *EKSStore) StartSearch(channel chan SearchResult) {
 			return
 		}
 
-		for _, clusterName := range clusters.Clusters {
+		for _, clusterName := range resp.Clusters {
+			// kubeconfig path used to uniquely identify this cluster
+			// eks_<profile>--<region>--<eks-cluster-name>
+			kubeconfigPath := fmt.Sprintf("eks_%s--%s--%s", *s.Config.Profile, *s.Config.Region, clusterName)
+
 			channel <- SearchResult{
-				KubeconfigPath: clusterName,
+				KubeconfigPath: kubeconfigPath,
 				Error:          nil,
 			}
 		}
+	}
+	s.GetLogger().Debugf("search done for EKS")
+}
 
-		if clusters.NextToken != nil {
-			opts.NextToken = clusters.NextToken
-		} else {
-			break
-		}
+// ParseIdentifier takes a kubeconfig identifier and
+// returns the
+// 1) the EKS resource group
+// 2) the name of the EKS cluster
+func parseEksIdentifier(path string) (string, string, string, error) {
+	split := strings.Split(path, "--")
+	switch len(split) {
+	case 3:
+		return strings.TrimPrefix(split[0], "eks_"), split[1], split[2], nil
+	default:
+		return "", "", "", fmt.Errorf("unable to parse kubeconfig path: %q", path)
 	}
 }
 
@@ -146,10 +183,27 @@ func (s *EKSStore) GetKubeconfigForPath(path string) ([]byte, error) {
 			return nil, fmt.Errorf("failed to initialize EKS store: %w", err)
 		}
 	}
-
-	cluster, err := s.Client.DescribeCluster(ctx, &awseks.DescribeClusterInput{Name: &path})
+	_, _, clusterName, err := parseEksIdentifier(path)
 	if err != nil {
 		return nil, err
+	}
+
+	cluster := s.DiscoveredClusters[path]
+	if cluster == nil {
+		resp, err := s.Client.DescribeCluster(ctx, &awseks.DescribeClusterInput{Name: &clusterName})
+		if err != nil {
+			return nil, err
+		}
+		s.DiscoveredClusters[path] = resp.Cluster
+		cluster = resp.Cluster
+	}
+
+	// context name does not include the location or the account as this information is already included in the path (different to gcloud)
+	contextName := fmt.Sprintf("eks_%s", *cluster.Name)
+
+	// need to provide a CA certificate in the kubeconfig (if not using insecure configuration)
+	if cluster.CertificateAuthority == nil || cluster.CertificateAuthority.Data == nil {
+		return nil, fmt.Errorf("cluster CA certificate not found for cluster=%s", *cluster.Arn)
 	}
 
 	kubeconfig := &types.KubeConfig{
@@ -158,40 +212,44 @@ func (s *EKSStore) GetKubeconfigForPath(path string) ([]byte, error) {
 			Kind:       "Config",
 		},
 		Clusters: []types.KubeCluster{{
-			Name: path,
+			Name: contextName,
 			Cluster: types.Cluster{
-				CertificateAuthorityData: *cluster.Cluster.CertificateAuthority.Data,
-				Server:                   *cluster.Cluster.Endpoint,
+				CertificateAuthorityData: *cluster.CertificateAuthority.Data,
+				Server:                   *cluster.Endpoint,
 			},
 		}},
-		CurrentContext: path,
+		CurrentContext: contextName,
 		Contexts: []types.KubeContext{
 			{
-				Name: path,
+				Name: contextName,
 				Context: types.Context{
-					Cluster: path,
-					User:    path,
+					Cluster: contextName,
+					User:    contextName,
 				},
 			},
 		},
-	}
-
-	if cluster.Cluster.Identity != nil {
-		kubeconfig.Users = []types.KubeUser{
+		Users: []types.KubeUser{
 			{
-				Name: path,
+				Name: contextName,
 				User: types.User{
 					ExecProvider: &types.ExecProvider{
 						APIVersion: "client.authentication.k8s.io/v1alpha1",
 						Command:    "aws",
-						Args:       []string{"--region", *s.Config.Region, "eks", "get-token", "--cluster-name", path},
+						Args: []string{
+							"--region",
+							*s.Config.Region,
+							"eks",
+							"get-token",
+							"--cluster-name",
+							*cluster.Name,
+						},
 						Env: []types.EnvMap{
 							{Name: "AWS_PROFILE", Value: *s.Config.Profile},
 						},
 					},
 				},
 			},
-		}
+		},
 	}
 
 	bytes, err := yaml.Marshal(kubeconfig)
@@ -199,10 +257,69 @@ func (s *EKSStore) GetKubeconfigForPath(path string) ([]byte, error) {
 	return bytes, err
 }
 
-func (s *EKSStore) GetLogger() *logrus.Entry {
-	return s.Logger
+func (s *EKSStore) GetSearchPreview(path string) (string, error) {
+	if !s.IsInitialized() {
+		// this takes too long, initialize concurrently
+		go func() {
+			if err := s.InitializeEKSStore(); err != nil {
+				s.Logger.Debugf("failed to initialize store: %v", err)
+			}
+		}()
+		return "", fmt.Errorf("eks store is not initalized yet")
+	}
+
+	// low timeout to not pile up many requests, but timeout fast
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	profile, region, clusterName, err := parseEksIdentifier(path)
+	if err != nil {
+		return "", err
+	}
+
+	// the cluster should be in the cache, but do not fail if it is not
+	cluster := s.DiscoveredClusters[path]
+
+	// cluster has not been discovered from the EKS API yet
+	// this is the case when a search index is used
+	if cluster == nil {
+		// The name of the cluster to retrieve.
+		// we can safely use the client, as we know the store has been previously initialized
+		resp, err := s.Client.DescribeCluster(ctx, &awseks.DescribeClusterInput{Name: &clusterName})
+		if err != nil {
+			return "", fmt.Errorf("failed to get Eks cluster with name %q : %w", clusterName, err)
+		}
+		cluster = resp.Cluster
+		s.DiscoveredClusters[path] = cluster
+	}
+
+	asciTree := gotree.New(clusterName)
+
+	if cluster.Version != nil {
+		asciTree.Add(fmt.Sprintf("Kubernetes Version: %s", *cluster.Version))
+	}
+	if cluster.PlatformVersion != nil {
+		asciTree.Add(fmt.Sprintf("Platform Version: %s", *cluster.PlatformVersion))
+	}
+
+	asciTree.Add(fmt.Sprintf("Status: %s", cluster.Status))
+	asciTree.Add(fmt.Sprintf("AWS Profile: %s", profile))
+	asciTree.Add(fmt.Sprintf("Region: %s", region))
+
+	return asciTree.Print(), nil
 }
 
-func (s *EKSStore) GetStoreConfig() types.KubeconfigStore {
-	return s.KubeconfigStore
+// AWSLogrusBridgeLogger is a Logger implementation that wraps the standard library logger, and delegates logging to it's
+// Printf method.
+type AWSLogrusBridgeLogger struct {
+	Logger *logrus.Entry
+}
+
+// Logf logs the given classification and message to the underlying logger.
+func (s AWSLogrusBridgeLogger) Logf(classification logging.Classification, format string, v ...interface{}) {
+	level, err := logrus.ParseLevel(string(classification))
+	if err != nil {
+		level = logrus.DebugLevel
+	}
+	s.Logger.Logf(level, format, v...)
 }
